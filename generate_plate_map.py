@@ -36,6 +36,38 @@ for c in PLATE_COLS:
 df = pd.read_csv(INPUT_FILE)
 df.columns = df.columns.str.strip()
 
+# ============================================================
+# FIX: Long_Gene_Destination_Plate duplicate source wells
+# Some Long_Gene pooling exports repeat one subunit across adjacent destination wells.
+# For SOURCE plate mapping, we want each (Source Plate, Source Well) counted once per gene.
+# ============================================================
+DEST_PLATE_COL = "Destination Plate Name"
+SUBUNIT_COL = "Subunit Name"  # optional if present
+
+if DEST_PLATE_COL in df.columns:
+    long_mask = df[DEST_PLATE_COL].astype(str).str.contains("Long_Gene", case=False, na=False)
+
+    dedup_cols = ["Source Plate Name", "Source Well", "Sequence Name"]
+    if SUBUNIT_COL in df.columns:
+        dedup_cols.append(SUBUNIT_COL)
+
+    df_long = df[long_mask].copy()
+    df_other = df[~long_mask].copy()
+
+    # Drop duplicates only for long-gene rows
+    before = len(df_long)
+    df_long = df_long.drop_duplicates(subset=dedup_cols, keep="first")
+    after = len(df_long)
+
+    # Optional: print what happened (useful in CLI logs; harmless in Streamlit logs)
+    if before != after:
+        print(f"INFO: Long_Gene dedup removed {before-after} duplicate row(s) (by {dedup_cols}).")
+
+    df = pd.concat([df_long, df_other], ignore_index=True)
+
+# ============================================================
+# REQUIRED COLUMNS CHECK
+# ============================================================
 required = ["Source Plate Name", "Source Well", "Sequence Name", "Transfer Volume"]
 missing = [c for c in required if c not in df.columns]
 if missing:
@@ -57,6 +89,7 @@ GENE_ID = {gene: f"G{i+1:02d}" for i, gene in enumerate(ALL_GENES)}
 # PROFESSIONAL DISTINCT COLORS (tab20 + tab20b + tab20c, softened)
 # ============================================================
 def soften_rgba(rgba, mix_with_white=0.18, desat=0.12):
+    """Make colors look more 'professional' (less neon)."""
     r, g, b, a = rgba
     h, s, v = mcolors.rgb_to_hsv((r, g, b))
     s = max(0.0, s * (1.0 - desat))
@@ -70,8 +103,8 @@ def build_palette():
     palettes = []
     for name in ["tab20", "tab20b", "tab20c"]:
         cmap = cm.get_cmap(name)
-        palettes.extend([cmap(i) for i in range(cmap.N)])
-    palettes = [soften_rgba(rgba) for rgba in palettes]
+        palettes.extend([cmap(i) for i in range(cmap.N)])  # each is RGBA
+    palettes = [soften_rgba(rgba) for rgba in palettes]  # ~60 softened categorical colors
     return palettes
 
 PALETTE = build_palette()
@@ -89,10 +122,10 @@ legend_rows = []
 # PDF GENERATION
 # ============================================================
 with PdfPages(OUTPUT_PDF) as pdf:
-
     for plate in plates:
         plate_df = df[df["Source Plate Name"] == plate]
 
+        # gene order per plate (first appearance)
         gene_order = []
         for g in plate_df["Sequence Name"]:
             if g not in gene_order:
@@ -101,13 +134,14 @@ with PdfPages(OUTPUT_PDF) as pdf:
         gene_counts = plate_df.groupby("Sequence Name").size().to_dict()
         well_volume = dict(zip(plate_df["Source Well"], plate_df["Transfer Volume"]))
 
+        # assign wells in serpentine order
         assignments = {}
         mer_index = {}
         gene_blocks = {}
         ptr = 0
 
         for gene in gene_order:
-            n = gene_counts[gene]
+            n = int(gene_counts[gene])
             wells = GLOBAL_WELLS[ptr:ptr + n]
             gene_blocks[gene] = wells
 
@@ -121,8 +155,10 @@ with PdfPages(OUTPUT_PDF) as pdf:
             vol_label = vols[0] if len(vols) == 1 else "varies"
             legend_rows.append([plate, GENE_ID[gene], gene, n, vol_label])
 
+        # ---------------- FIGURE ----------------
         fig, ax = plt.subplots(figsize=(28, 3.3))
 
+        # ---------------- PLATE GRID ----------------
         for r, row in enumerate(PLATE_ROWS):
             for c, col in enumerate(PLATE_COLS):
                 well = f"{row}{col:02d}"
@@ -144,6 +180,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
                     ))
 
                 if well in mer_index:
+                    # Line 1: 100mer index
                     ax.text(
                         c + 0.5, y + 0.38,
                         f"#{mer_index[well]}",
@@ -151,6 +188,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
                         fontweight="bold",
                         ha="center", va="center"
                     )
+                    # Line 2: volume
                     ax.text(
                         c + 0.5, y + 0.18,
                         f"{well_volume.get(well, '')} µL",
@@ -158,30 +196,41 @@ with PdfPages(OUTPUT_PDF) as pdf:
                         ha="center", va="center"
                     )
 
+        # ---------------- COLUMN HEADERS ----------------
         for c, col in enumerate(PLATE_COLS):
             ax.add_patch(Rectangle((c, 2), 1, 0.28, fill=False, linewidth=0.8))
-            ax.text(c + 0.5, 2.14, str(col),
-                    ha="center", va="center",
-                    fontsize=9, fontweight="bold")
+            ax.text(
+                c + 0.5, 2.14, str(col),
+                ha="center", va="center",
+                fontsize=9, fontweight="bold"
+            )
 
+        # ---------------- ROW HEADERS ----------------
         for r, row in enumerate(PLATE_ROWS):
             y = 1 - r
             ax.add_patch(Rectangle((-0.7, y), 0.7, 1, fill=False, linewidth=0.8))
-            ax.text(-0.35, y + 0.5, row,
-                    ha="center", va="center",
-                    fontsize=11, fontweight="bold")
+            ax.text(
+                -0.35, y + 0.5, row,
+                ha="center", va="center",
+                fontsize=11, fontweight="bold"
+            )
 
+        # ---------------- BLOCK LABELS ----------------
         for gene, wells in gene_blocks.items():
             idxs = [GLOBAL_WELLS.index(w) for w in wells]
             mid = (min(idxs) + max(idxs)) / 2
             col_mid = int(mid // 2)
             row_mid = 1 if int(mid) % 2 == 0 else 0
-            ax.text(col_mid + 0.5, row_mid + 0.82,
-                    GENE_ID[gene],
-                    fontsize=12,
-                    fontweight="bold",
-                    ha="center")
 
+            ax.text(
+                col_mid + 0.5, row_mid + 0.82,
+                GENE_ID[gene],
+                fontsize=12,
+                fontweight="bold",
+                ha="center"
+            )
+
+        # ---------------- LEGEND ----------------
         legend_x0 = len(PLATE_COLS) + 0.6
         legend_y_top = 2.25
         row_step = 0.30
@@ -202,6 +251,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
                 edgecolor="black",
                 linewidth=0.5
             ))
+
             ax.text(
                 lx + box_size + 0.12,
                 ly - box_size / 2,
@@ -211,6 +261,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
                 va="center"
             )
 
+        # ---------------- TITLE ----------------
         ax.text(
             len(PLATE_COLS) / 2,
             2.48,
@@ -232,11 +283,12 @@ with PdfPages(OUTPUT_PDF) as pdf:
 # ============================================================
 # EXCEL OUTPUT (Plate map sheets + Legend with volume)
 # ============================================================
-thin = Side(style="thin")
-
 for plate in plates:
     ws = wb.create_sheet(title=plate[:31])
+
+    # Header row (columns 1..24)
     ws.append([""] + [str(c) for c in PLATE_COLS])
+    # Row labels A/B
     for row in PLATE_ROWS:
         ws.append([row] + [""] * len(PLATE_COLS))
 
@@ -250,7 +302,7 @@ for plate in plates:
 
     ptr = 0
     for gene in gene_order:
-        n = gene_counts[gene]
+        n = int(gene_counts[gene])
         wells = GLOBAL_WELLS[ptr:ptr + n]
 
         rgba = GENE_COLOR[gene]
@@ -268,6 +320,7 @@ for plate in plates:
 
         ptr += n
 
+# Legend sheet
 ws_leg = wb.create_sheet(title="Legend")
 ws_leg.append(["Source Plate", "Gene ID", "Gene Name", "#100mers", "Volume (µL)"])
 for row in legend_rows:
