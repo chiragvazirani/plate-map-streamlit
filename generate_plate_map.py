@@ -10,6 +10,7 @@ from openpyxl.styles import PatternFill, Alignment, Border, Side
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
+
 # ============================================================
 # INPUT / OUTPUT
 # ============================================================
@@ -19,16 +20,19 @@ run_tag = os.path.splitext(os.path.basename(INPUT_FILE))[0]
 OUTPUT_PDF = f"{run_tag}_source_plate_map.pdf"
 OUTPUT_XLSX = f"{run_tag}_source_plate_map.xlsx"
 
+
 # ============================================================
-# PLATE DEFINITION
+# PLATE DEFINITION (Echo source plate: 2 rows x 24 cols)
 # ============================================================
 PLATE_ROWS = ["A", "B"]
 PLATE_COLS = list(range(1, 25))
 
+# Serpentine / interleaved order: A01, B01, A02, B02, ...
 GLOBAL_WELLS = []
 for c in PLATE_COLS:
     GLOBAL_WELLS.append(f"A{c:02d}")
     GLOBAL_WELLS.append(f"B{c:02d}")
+
 
 # ============================================================
 # LOAD DATA
@@ -36,38 +40,6 @@ for c in PLATE_COLS:
 df = pd.read_csv(INPUT_FILE)
 df.columns = df.columns.str.strip()
 
-# ============================================================
-# FIX: Long_Gene_Destination_Plate duplicate source wells
-# Some Long_Gene pooling exports repeat one subunit across adjacent destination wells.
-# For SOURCE plate mapping, we want each (Source Plate, Source Well) counted once per gene.
-# ============================================================
-DEST_PLATE_COL = "Destination Plate Name"
-SUBUNIT_COL = "Subunit Name"  # optional if present
-
-if DEST_PLATE_COL in df.columns:
-    long_mask = df[DEST_PLATE_COL].astype(str).str.contains("Long_Gene", case=False, na=False)
-
-    dedup_cols = ["Source Plate Name", "Source Well", "Sequence Name"]
-    if SUBUNIT_COL in df.columns:
-        dedup_cols.append(SUBUNIT_COL)
-
-    df_long = df[long_mask].copy()
-    df_other = df[~long_mask].copy()
-
-    # Drop duplicates only for long-gene rows
-    before = len(df_long)
-    df_long = df_long.drop_duplicates(subset=dedup_cols, keep="first")
-    after = len(df_long)
-
-    # Optional: print what happened (useful in CLI logs; harmless in Streamlit logs)
-    if before != after:
-        print(f"INFO: Long_Gene dedup removed {before-after} duplicate row(s) (by {dedup_cols}).")
-
-    df = pd.concat([df_long, df_other], ignore_index=True)
-
-# ============================================================
-# REQUIRED COLUMNS CHECK
-# ============================================================
 required = ["Source Plate Name", "Source Well", "Sequence Name", "Transfer Volume"]
 missing = [c for c in required if c not in df.columns]
 if missing:
@@ -75,21 +47,24 @@ if missing:
 
 plates = list(df["Source Plate Name"].unique())
 
-# ============================================================
-# GLOBAL GENE LIST + IDs (first-seen order)
-# ============================================================
-ALL_GENES = []
-for g in df["Sequence Name"]:
-    if g not in ALL_GENES:
-        ALL_GENES.append(g)
+HAS_DEST = "Destination Plate Name" in df.columns
 
-GENE_ID = {gene: f"G{i+1:02d}" for i, gene in enumerate(ALL_GENES)}
+
+# ============================================================
+# GLOBAL CONSTRUCT LIST + IDs (first-seen order)
+# ============================================================
+ALL_CONSTRUCTS = []
+for g in df["Sequence Name"]:
+    if g not in ALL_CONSTRUCTS:
+        ALL_CONSTRUCTS.append(g)
+
+CONSTRUCT_ID = {name: f"C{i+1:02d}" for i, name in enumerate(ALL_CONSTRUCTS)}
+
 
 # ============================================================
 # PROFESSIONAL DISTINCT COLORS (tab20 + tab20b + tab20c, softened)
 # ============================================================
 def soften_rgba(rgba, mix_with_white=0.18, desat=0.12):
-    """Make colors look more 'professional' (less neon)."""
     r, g, b, a = rgba
     h, s, v = mcolors.rgb_to_hsv((r, g, b))
     s = max(0.0, s * (1.0 - desat))
@@ -103,12 +78,46 @@ def build_palette():
     palettes = []
     for name in ["tab20", "tab20b", "tab20c"]:
         cmap = cm.get_cmap(name)
-        palettes.extend([cmap(i) for i in range(cmap.N)])  # each is RGBA
-    palettes = [soften_rgba(rgba) for rgba in palettes]  # ~60 softened categorical colors
+        palettes.extend([cmap(i) for i in range(cmap.N)])
+    palettes = [soften_rgba(rgba) for rgba in palettes]  # ~60 softened colors
     return palettes
 
 PALETTE = build_palette()
-GENE_COLOR = {gene: PALETTE[i % len(PALETTE)] for i, gene in enumerate(ALL_GENES)}
+CONSTRUCT_COLOR = {name: PALETTE[i % len(PALETTE)] for i, name in enumerate(ALL_CONSTRUCTS)}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def is_long_gene_dest_plate(frame: pd.DataFrame) -> bool:
+    """True if this plate dataframe includes any Destination Plate Name containing Long_Gene_Destination_Plate."""
+    if "Destination Plate Name" not in frame.columns:
+        return False
+    s = frame["Destination Plate Name"].astype(str)
+    return s.str.contains("Long_Gene_Destination_Plate", case=False, na=False).any()
+
+def ordered_unique_source_wells(frame: pd.DataFrame, construct: str) -> list:
+    """
+    Return source wells for a construct in first-seen order.
+    For Long_Gene_Destination_Plate style pooling, dedupe wells so shared subunits aren't double-counted.
+    """
+    sub = frame[frame["Sequence Name"] == construct]
+
+    if is_long_gene_dest_plate(frame):
+        # ✅ Fix: count each source well only once for that construct on this plate
+        return sub["Source Well"].astype(str).drop_duplicates(keep="first").tolist()
+    else:
+        # Default behavior: each row is a unique subunit source well in practice,
+        # but keep as-is in case you ever intentionally split volumes across multiple transfers.
+        return sub["Source Well"].astype(str).tolist()
+
+def first_volume_for_well(frame: pd.DataFrame, construct: str, source_well: str):
+    """Pick the first transfer volume for (construct, source_well) on this plate."""
+    sub = frame[(frame["Sequence Name"] == construct) & (frame["Source Well"].astype(str) == str(source_well))]
+    if len(sub) == 0:
+        return ""
+    return sub["Transfer Volume"].iloc[0]
+
 
 # ============================================================
 # EXCEL SETUP
@@ -118,42 +127,57 @@ wb.remove(wb.active)
 thin = Side(style="thin")
 legend_rows = []
 
+
 # ============================================================
 # PDF GENERATION
 # ============================================================
 with PdfPages(OUTPUT_PDF) as pdf:
+
+    # ✅ running counter across plates for continuity
+    construct_offset = {name: 0 for name in ALL_CONSTRUCTS}
+
     for plate in plates:
-        plate_df = df[df["Source Plate Name"] == plate]
+        plate_df = df[df["Source Plate Name"] == plate].copy()
 
-        # gene order per plate (first appearance)
-        gene_order = []
+        # construct order per plate (first appearance)
+        construct_order = []
         for g in plate_df["Sequence Name"]:
-            if g not in gene_order:
-                gene_order.append(g)
+            if g not in construct_order:
+                construct_order.append(g)
 
-        gene_counts = plate_df.groupby("Sequence Name").size().to_dict()
-        well_volume = dict(zip(plate_df["Source Well"], plate_df["Transfer Volume"]))
+        # Build per-construct well lists (with Long_Gene dedupe fix)
+        construct_wells = {c: ordered_unique_source_wells(plate_df, c) for c in construct_order}
+        construct_counts = {c: len(construct_wells[c]) for c in construct_order}
 
-        # assign wells in serpentine order
-        assignments = {}
-        mer_index = {}
-        gene_blocks = {}
+        # Allocate positions on the 2x24 source plate in serpentine GLOBAL_WELLS
+        assignments = {}     # plate-position well (A01/B01/...) -> construct
+        mer_index = {}       # plate-position well -> global subunit index (continuous)
+        well_volume = {}     # plate-position well -> volume (from source well rows)
+        construct_blocks = {}  # construct -> list of plate-position wells
         ptr = 0
 
-        for gene in gene_order:
-            n = int(gene_counts[gene])
-            wells = GLOBAL_WELLS[ptr:ptr + n]
-            gene_blocks[gene] = wells
+        for construct in construct_order:
+            n = construct_counts[construct]
+            positions = GLOBAL_WELLS[ptr:ptr + n]   # positions on the physical source plate
+            construct_blocks[construct] = positions
 
-            for i, w in enumerate(wells, start=1):
-                assignments[w] = gene
-                mer_index[w] = i
+            start_idx = construct_offset[construct]
 
+            src_wells = construct_wells[construct]  # source wells from file (may include duplicates if not long-gene)
+
+            for i, pos in enumerate(positions, start=1):
+                assignments[pos] = construct
+                mer_index[pos] = start_idx + i  # ✅ continuous numbering
+                src_w = src_wells[i - 1]
+                well_volume[pos] = first_volume_for_well(plate_df, construct, src_w)
+
+            construct_offset[construct] += n
             ptr += n
 
-            vols = plate_df[plate_df["Sequence Name"] == gene]["Transfer Volume"].unique()
+            # Legend row (per plate)
+            vols = plate_df[plate_df["Sequence Name"] == construct]["Transfer Volume"].unique()
             vol_label = vols[0] if len(vols) == 1 else "varies"
-            legend_rows.append([plate, GENE_ID[gene], gene, n, vol_label])
+            legend_rows.append([plate, CONSTRUCT_ID[construct], construct, n, vol_label])
 
         # ---------------- FIGURE ----------------
         fig, ax = plt.subplots(figsize=(28, 3.3))
@@ -161,13 +185,13 @@ with PdfPages(OUTPUT_PDF) as pdf:
         # ---------------- PLATE GRID ----------------
         for r, row in enumerate(PLATE_ROWS):
             for c, col in enumerate(PLATE_COLS):
-                well = f"{row}{col:02d}"
+                pos = f"{row}{col:02d}"
                 y = 1 - r
 
-                if well in assignments:
+                if pos in assignments:
                     ax.add_patch(Rectangle(
                         (c, y), 1, 1,
-                        facecolor=GENE_COLOR[assignments[well]],
+                        facecolor=CONSTRUCT_COLOR[assignments[pos]],
                         edgecolor="black",
                         linewidth=0.6
                     ))
@@ -179,19 +203,17 @@ with PdfPages(OUTPUT_PDF) as pdf:
                         linewidth=0.6
                     ))
 
-                if well in mer_index:
-                    # Line 1: 100mer index
+                if pos in mer_index:
                     ax.text(
                         c + 0.5, y + 0.38,
-                        f"#{mer_index[well]}",
+                        f"#{mer_index[pos]}",
                         fontsize=9.5,
                         fontweight="bold",
                         ha="center", va="center"
                     )
-                    # Line 2: volume
                     ax.text(
                         c + 0.5, y + 0.18,
-                        f"{well_volume.get(well, '')} µL",
+                        f"{well_volume.get(pos, '')} µL",
                         fontsize=8.5,
                         ha="center", va="center"
                     )
@@ -215,16 +237,16 @@ with PdfPages(OUTPUT_PDF) as pdf:
                 fontsize=11, fontweight="bold"
             )
 
-        # ---------------- BLOCK LABELS ----------------
-        for gene, wells in gene_blocks.items():
-            idxs = [GLOBAL_WELLS.index(w) for w in wells]
+        # ---------------- BLOCK LABELS (Construct IDs) ----------------
+        for construct, positions in construct_blocks.items():
+            idxs = [GLOBAL_WELLS.index(p) for p in positions]
             mid = (min(idxs) + max(idxs)) / 2
             col_mid = int(mid // 2)
             row_mid = 1 if int(mid) % 2 == 0 else 0
 
             ax.text(
                 col_mid + 0.5, row_mid + 0.82,
-                GENE_ID[gene],
+                CONSTRUCT_ID[construct],
                 fontsize=12,
                 fontweight="bold",
                 ha="center"
@@ -234,28 +256,27 @@ with PdfPages(OUTPUT_PDF) as pdf:
         legend_x0 = len(PLATE_COLS) + 0.6
         legend_y_top = 2.25
         row_step = 0.30
-        genes_per_col = 8
+        constructs_per_col = 8
         box_size = 0.16
         col_width = 4.6
 
-        for i, gene in enumerate(gene_order):
-            col_idx = i // genes_per_col
-            row_idx = i % genes_per_col
+        for i, construct in enumerate(construct_order):
+            col_idx = i // constructs_per_col
+            row_idx = i % constructs_per_col
             lx = legend_x0 + col_idx * col_width
             ly = legend_y_top - row_idx * row_step
 
             ax.add_patch(Rectangle(
                 (lx, ly - box_size),
                 box_size, box_size,
-                facecolor=GENE_COLOR[gene],
+                facecolor=CONSTRUCT_COLOR[construct],
                 edgecolor="black",
                 linewidth=0.5
             ))
-
             ax.text(
                 lx + box_size + 0.12,
                 ly - box_size / 2,
-                f"{GENE_ID[gene]}  {gene}  ({gene_counts[gene]}×100mers)",
+                f"{CONSTRUCT_ID[construct]}  {construct}  ({construct_counts[construct]}×100mers)",
                 fontsize=9.0,
                 ha="left",
                 va="center"
@@ -280,49 +301,51 @@ with PdfPages(OUTPUT_PDF) as pdf:
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
+
 # ============================================================
-# EXCEL OUTPUT (Plate map sheets + Legend with volume)
+# EXCEL OUTPUT
+# Sheet per plate = horizontal color map (IDs only)
+# Legend sheet = ID, construct name, counts, volume
 # ============================================================
 for plate in plates:
     ws = wb.create_sheet(title=plate[:31])
 
-    # Header row (columns 1..24)
     ws.append([""] + [str(c) for c in PLATE_COLS])
-    # Row labels A/B
     for row in PLATE_ROWS:
         ws.append([row] + [""] * len(PLATE_COLS))
 
-    plate_df = df[df["Source Plate Name"] == plate]
-    gene_order = []
-    for g in plate_df["Sequence Name"]:
-        if g not in gene_order:
-            gene_order.append(g)
+    plate_df = df[df["Source Plate Name"] == plate].copy()
 
-    gene_counts = plate_df.groupby("Sequence Name").size().to_dict()
+    construct_order = []
+    for g in plate_df["Sequence Name"]:
+        if g not in construct_order:
+            construct_order.append(g)
+
+    construct_wells = {c: ordered_unique_source_wells(plate_df, c) for c in construct_order}
+    construct_counts = {c: len(construct_wells[c]) for c in construct_order}
 
     ptr = 0
-    for gene in gene_order:
-        n = int(gene_counts[gene])
-        wells = GLOBAL_WELLS[ptr:ptr + n]
+    for construct in construct_order:
+        n = construct_counts[construct]
+        positions = GLOBAL_WELLS[ptr:ptr + n]
 
-        rgba = GENE_COLOR[gene]
+        rgba = CONSTRUCT_COLOR[construct]
         hex_color = "%02X%02X%02X" % tuple(int(255 * x) for x in rgba[:3])
         fill = PatternFill(start_color=hex_color, end_color=hex_color, fill_type="solid")
 
-        for w in wells:
-            r = PLATE_ROWS.index(w[0]) + 2
-            c = int(w[1:]) + 1
+        for pos in positions:
+            r = PLATE_ROWS.index(pos[0]) + 2
+            c = int(pos[1:]) + 1
             cell = ws.cell(row=r, column=c)
             cell.fill = fill
-            cell.value = GENE_ID[gene]
+            cell.value = CONSTRUCT_ID[construct]
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
         ptr += n
 
-# Legend sheet
 ws_leg = wb.create_sheet(title="Legend")
-ws_leg.append(["Source Plate", "Gene ID", "Gene Name", "#100mers", "Volume (µL)"])
+ws_leg.append(["Source Plate", "Construct ID", "Construct Name", "#unique 100mers", "Volume (µL)"])
 for row in legend_rows:
     ws_leg.append(row)
 
